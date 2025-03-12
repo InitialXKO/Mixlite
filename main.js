@@ -19,19 +19,16 @@ const {
     Model_think_MAX_TOKENS,
     Model_think_TEMPERATURE,
     Model_think_WebSearch,
-    Model_think_TopK,
-    Model_think_TopP,
     Think_PROMPT,
     Model_output_API_KEY,
     Model_output_MODEL,
     Model_output_MAX_TOKENS,
     Model_output_TEMPERATURE,
     Model_output_WebSearch,
-    Model_output_TopK,
-    Model_output_TopP,
     RELAY_PROMPT,
     HYBRID_MODEL_NAME,
-    OUTPUT_API_KEY
+    OUTPUT_API_KEY,
+    Show_COT
 } = process.env;
 
 // 用于存储当前任务的信息
@@ -87,7 +84,8 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
     const cancelTokenSource = axios.CancelToken.source();
     currentTask = { 
         res,
-        cancelTokenSource
+        cancelTokenSource,
+        thinkingSent: false // 标记是否已发送思考内容
     };
 
     try {
@@ -146,21 +144,21 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             model: Model_think_MODEL,
             messages: thinkingMessages,
             temperature: parseFloat(Model_think_TEMPERATURE),
-            stream: false
+            stream: stream // 使用客户端请求的流式设置
         };
 
         if (Model_think_WebSearch === 'true') {
             thinkingConfig.tools = [{
                 type: "function",
                 function: {
-                    name: "webSearch",
-                    description: "Search the web for information",
+                    name: "googleSearch",
+                    description: "Search the web for relevant information",
                     parameters: {
                         type: "object",
                         properties: {
                             query: {
                                 type: "string",
-                                description: "Search query"
+                                description: "The search query"
                             }
                         },
                         required: ["query"]
@@ -177,27 +175,154 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
         });
 
         // 执行思考阶段
-        const thinkingResponse = await axios.post(
-            `${PROXY_URL}/v1/chat/completions`,
-            thinkingConfig,
-            {
-                headers: {
-                    Authorization: `Bearer ${Model_think_API_KEY}`,
-                    'Content-Type': 'application/json',
-                },
-                cancelToken: cancelTokenSource.token,
-                // 添加超时设置
-                timeout: 30000,
-                // 添加代理错误处理
-                validateStatus: function (status) {
-                    return status >= 200 && status < 300;
+        let thinkingContent = '';
+        
+        if (stream) {
+            // 流式思考阶段
+            const thinkingResponse = await axios.post(
+                `${PROXY_URL}/v1/chat/completions`,
+                thinkingConfig,
+                {
+                    headers: {
+                        Authorization: `Bearer ${Model_think_API_KEY}`,
+                        'Content-Type': 'application/json',
+                        'Accept': 'text/event-stream'
+                    },
+                    responseType: 'stream',
+                    cancelToken: cancelTokenSource.token,
+                    timeout: 30000,
+                    validateStatus: function (status) {
+                        return status >= 200 && status < 300;
+                    }
                 }
+            );
+            
+            // 收集思考内容并实时发送给客户端
+            const thinkingChunks = [];
+            let isFirstThinkingChunk = true;
+            
+            // 设置SSE响应头
+            if (Show_COT === 'true' && !res.headersSent) {
+                res.writeHead(200, {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'X-Accel-Buffering': 'no'
+                });
             }
-        );
+            
+            await new Promise((resolve, reject) => {
+                thinkingResponse.data.on('data', chunk => {
+                    try {
+                        const lines = chunk.toString().split('\n').filter(line => line.trim() !== '');
+                        
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const data = line.slice(6);
+                                if (data === '[DONE]') {
+                                    continue;
+                                }
+                                
+                                try {
+                                    const parsed = JSON.parse(data);
+                                    const content = parsed.choices[0]?.delta?.content || '';
+                                    
+                                    if (content) {
+                                        thinkingChunks.push(content);
+                                        
+                                        // 如果需要显示思考内容，实时发送给客户端
+                                        if (Show_COT === 'true') {
+                                            // 简化的流式日志
+                                            process.stdout.write(content);
+                                            
+                                            // 为第一个思考块添加<think>标签
+                                            let outputContent = content;
+                                            if (isFirstThinkingChunk) {
+                                                outputContent = `<think>${content}`;
+                                                isFirstThinkingChunk = false;
+                                            }
+                                            
+                                            const formattedChunk = {
+                                                id: `chatcmpl-${Date.now()}`,
+                                                object: 'chat.completion.chunk',
+                                                created: Math.floor(Date.now() / 1000),
+                                                model: HYBRID_MODEL_NAME,
+                                                choices: [{
+                                                    delta: { content: outputContent },
+                                                    index: 0,
+                                                    finish_reason: null
+                                                }]
+                                            };
+                                            res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
+                                        }
+                                    }
+                                } catch (parseError) {
+                                    console.error('解析思考响应失败:', parseError.message);
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error('处理思考响应出错:', error.message);
+                    }
+                });
+                
+                thinkingResponse.data.on('error', error => {
+                    console.error('思考流错误:', error);
+                    reject(error);
+                });
+                
+                thinkingResponse.data.on('end', () => {
+                    console.log('思考流结束');
+                    // 如果需要显示思考内容，添加思考结束标签
+                    if (Show_COT === 'true' && !isFirstThinkingChunk) {
+                        const formattedChunk = {
+                            id: `chatcmpl-${Date.now()}`,
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: HYBRID_MODEL_NAME,
+                            choices: [{
+                                delta: { content: '</think>\n\n' },
+                                index: 0,
+                                finish_reason: null
+                            }]
+                        };
+                        res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
+                    }
+                    resolve();
+                });
+            });
+            
+            thinkingContent = thinkingChunks.join('');
+            console.log('思考阶段内容收集完成');
+            
+            // 标记思考内容已发送
+            if (Show_COT === 'true') {
+                currentTask.thinkingSent = true;
+            }
+        } else {
+            // 非流式思考阶段
+            const thinkingResponse = await axios.post(
+                `${PROXY_URL}/v1/chat/completions`,
+                thinkingConfig,
+                {
+                    headers: {
+                        Authorization: `Bearer ${Model_think_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    cancelToken: cancelTokenSource.token,
+                    timeout: 30000,
+                    validateStatus: function (status) {
+                        return status >= 200 && status < 300;
+                    }
+                }
+            );
 
-        console.log('思考阶段响应:', JSON.stringify(thinkingResponse.data, null, 2));
-
-        const thinkingContent = thinkingResponse.data.choices[0].message.content;
+            console.log('思考阶段响应:', JSON.stringify(thinkingResponse.data, null, 2));
+            thinkingContent = thinkingResponse.data.choices[0].message.content;
+        }
+        
+        // 保存思考内容，用于后续处理
+        const originalThinkingContent = thinkingContent;
 
         // 修改输出阶段的消息构建
         const outputMessages = [
@@ -228,14 +353,14 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             outputConfig.tools = [{
                 type: "function",
                 function: {
-                    name: "webSearch",
-                    description: "Search the web for information",
+                    name: "googleSearch",
+                    description: "Search the web for relevant information",
                     parameters: {
                         type: "object",
                         properties: {
                             query: {
                                 type: "string",
-                                description: "Search query"
+                                description: "The search query"
                             }
                         },
                         required: ["query"]
@@ -270,13 +395,15 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
 
                 console.log('输出阶段响应头:', outputResponse.headers);
                 
-                // 设置SSE响应头
-                res.writeHead(200, {
-                    'Content-Type': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive',
-                    'X-Accel-Buffering': 'no'
-                });
+                // 设置SSE响应头，仅在头部未发送时设置
+                if (!res.headersSent) {
+                    res.writeHead(200, {
+                        'Content-Type': 'text/event-stream',
+                        'Cache-Control': 'no-cache',
+                        'Connection': 'keep-alive',
+                        'X-Accel-Buffering': 'no'
+                    });
+                }
 
                 // 改进的数据处理
                 outputResponse.data.on('data', chunk => {
@@ -299,13 +426,27 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
                                         // 简化的流式日志
                                         process.stdout.write(content);
                                         
+                                        // 根据Show_COT决定是否显示思考内容
+                                        let outputContent = content;
+                                        
+                                        // 只有在之前没有发送过思考内容的情况下才添加
+                                        // 由于我们在思考阶段可能已经发送了思考内容，这里需要检查
+                                        if (Show_COT === 'true' && !currentTask.thinkingSent) {
+                                            // 添加思考内容
+                                            outputContent = `<think>${originalThinkingContent}</think>\n\n${content}`;
+                                            currentTask.thinkingSent = true;
+                                        } else if (Show_COT !== 'true') {
+                                            // 如果不显示思考内容，直接使用原始内容
+                                            outputContent = content;
+                                        }
+                                        
                                         const formattedChunk = {
                                             id: `chatcmpl-${Date.now()}`,
                                             object: 'chat.completion.chunk',
                                             created: Math.floor(Date.now() / 1000),
                                             model: HYBRID_MODEL_NAME,
                                             choices: [{
-                                                delta: { content },
+                                                delta: { content: outputContent },
                                                 index: 0,
                                                 finish_reason: null
                                             }]
@@ -352,12 +493,19 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
                     headers: error.response?.headers
                 });
                 
-                if (!res.writableEnded) {
+                if (!res.headersSent && !res.writableEnded) {
                     res.status(500).json({
                         error: 'Stream request failed',
                         message: error.message,
                         details: error.response?.data
                     });
+                } else if (!res.writableEnded) {
+                    // 如果头部已发送但响应未结束，以SSE格式发送错误
+                    res.write(`data: {"error": "Stream request failed: ${error.message.replace(/"/g, '\\"')}"}
+
+`);
+                    res.write('data: [DONE]\n\n');
+                    res.end();
                 }
                 currentTask = null;
             }
@@ -381,7 +529,25 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             );
 
             console.log('输出阶段响应:', JSON.stringify(outputResponse.data, null, 2));
-            res.json(outputResponse.data);
+            
+            // 处理非流式输出的思考内容显示
+            if (Show_COT === 'true') {
+                // 如果需要显示思考内容，修改响应
+                const modifiedResponse = {
+                    ...outputResponse.data,
+                    choices: outputResponse.data.choices.map(choice => ({
+                        ...choice,
+                        message: {
+                            ...choice.message,
+                            content: `<think>${originalThinkingContent}</think>\n\n${choice.message.content}`
+                        }
+                    }))
+                };
+                res.json(modifiedResponse);
+            } else {
+                // 直接返回原始响应
+                res.json(outputResponse.data);
+            }
             currentTask = null;
         }
 
