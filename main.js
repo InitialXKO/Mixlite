@@ -19,12 +19,14 @@ const {
     Model_think_MAX_TOKENS,
     Model_think_TEMPERATURE,
     Model_think_WebSearch,
+    Model_think_image,
     Think_PROMPT,
     Model_output_API_KEY,
     Model_output_MODEL,
     Model_output_MAX_TOKENS,
     Model_output_TEMPERATURE,
     Model_output_WebSearch,
+    Model_output_image,
     RELAY_PROMPT,
     HYBRID_MODEL_NAME,
     OUTPUT_API_KEY,
@@ -95,7 +97,13 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             if (msg.content && Array.isArray(msg.content)) {
                 return {
                     ...msg,
-                    content: msg.content.map(content => {
+                    content: msg.content.filter(content => {
+                        // 根据Model_think_image参数过滤图片内容
+                        if (content.type === 'image_url' && Model_think_image !== 'true') {
+                            return false;
+                        }
+                        return true;
+                    }).map(content => {
                         if (content.type === 'text') {
                             return content;
                         } else if (content.type === 'image_url') {
@@ -329,16 +337,36 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             {
                 role: "system",
                 content: RELAY_PROMPT
-            },
-            {
-                role: "user",
-                content: messages[messages.length - 1].content // 原始问题
-            },
-            {
-                role: "user",  // 将 assistant 改为 user
-                content: thinkingContent
             }
         ];
+        
+        // 添加原始问题，处理多模态内容
+        const lastUserMessage = messages[messages.length - 1];
+        if (lastUserMessage.content && Array.isArray(lastUserMessage.content)) {
+            // 处理多模态内容，根据Model_output_image参数过滤图片
+            outputMessages.push({
+                role: "user",
+                content: lastUserMessage.content.filter(content => {
+                    // 根据Model_output_image参数过滤图片内容
+                    if (content.type === 'image_url' && Model_output_image !== 'true') {
+                        return false;
+                    }
+                    return true;
+                })
+            });
+        } else {
+            // 普通文本内容
+            outputMessages.push({
+                role: "user",
+                content: lastUserMessage.content
+            });
+        }
+        
+        // 添加思考内容
+        outputMessages.push({
+            role: "user",  // 将 assistant 改为 user
+            content: thinkingContent
+        });
 
         // 修改输出阶段的配置
         const outputConfig = {
