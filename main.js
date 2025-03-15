@@ -340,6 +340,12 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             }
         ];
         
+        // 添加完整的对话历史，而不仅仅是最后一条消息
+        // 将原始消息数组中除最后一条消息外的所有消息添加到输出消息中
+        for (let i = 0; i < messages.length - 1; i++) {
+            outputMessages.push(messages[i]);
+        }
+        
         // 添加原始问题，处理多模态内容
         const lastUserMessage = messages[messages.length - 1];
         if (lastUserMessage.content && Array.isArray(lastUserMessage.content)) {
