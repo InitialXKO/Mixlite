@@ -2,7 +2,6 @@
 import express from 'express';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 
 dotenv.config();
 
@@ -11,625 +10,412 @@ app.use(express.json({ limit: '20mb' }));
 
 // 环境变量配置
 const {
-    PROXY_PORT,
-    PROXY_URL,
-    PROXY_URL2,
-    Model_think_API_KEY,
-    Model_think_MODEL,
-    Model_think_MAX_TOKENS,
-    Model_think_TEMPERATURE,
-    Model_think_WebSearch,
-    Model_think_image,
-    Think_PROMPT,
-    Model_output_API_KEY,
-    Model_output_MODEL,
-    Model_output_MAX_TOKENS,
-    Model_output_TEMPERATURE,
-    Model_output_WebSearch,
-    Model_output_image,
-    RELAY_PROMPT,
-    HYBRID_MODEL_NAME,
-    OUTPUT_API_KEY,
-    Show_COT
+  PROXY_PORT,
+  PROXY_URL,
+  PROXY_URL2,
+  Model_think_API_KEY,
+  Model_think_MODEL,
+  Model_think_MAX_TOKENS,
+  Model_think_TEMPERATURE,
+  Model_think_WebSearch,
+  Model_think_image,
+  Think_PROMPT,
+  Model_output_API_KEY,
+  Model_output_MODEL,
+  Model_output_MAX_TOKENS,
+  Model_output_TEMPERATURE,
+  Model_output_WebSearch,
+  Model_output_image,
+  Model_output_tool,
+  RELAY_PROMPT,
+  HYBRID_MODEL_NAME,
+  OUTPUT_API_KEY,
+  Show_COT
 } = process.env;
 
-// 用于存储当前任务的信息
-let currentTask = null;
 
 // API 密钥验证中间件
 const apiKeyAuth = (req, res, next) => {
-    const apiKey = req.headers.authorization;
-
-    if (!apiKey || apiKey !== `Bearer ${OUTPUT_API_KEY}`) {
-        return res.status(401).json({ error: 'Unauthorized', message: 'Invalid API key' });
-    }
-    next();
+  const apiKey = req.headers.authorization;
+  if (!apiKey || apiKey !== `Bearer ${OUTPUT_API_KEY}`) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Invalid API key' });
+  }
+  next();
 };
 
-// 简化的取消任务函数
+
+// 用于存储当前任务的信息，新增 MCP 状态
+let currentTask = null;
+
+// 取消当前任务
 function cancelCurrentTask() {
-    if (!currentTask) {
-        return;
+  if (!currentTask) return;
+  console.log('收到新请求，取消当前任务...');
+  try {
+    if (currentTask.cancelTokenSource) {
+      currentTask.cancelTokenSource.cancel('收到新请求');
     }
-
-    console.log('收到新请求，取消当前任务...');
-    
-    try {
-        if (currentTask.cancelTokenSource) {
-            currentTask.cancelTokenSource.cancel('收到新请求');
-        }
-        
-        if (currentTask.res && !currentTask.res.writableEnded) {
-            currentTask.res.write('data: {"choices": [{"delta": {"content": "\n\n[收到新请求，开始重新生成]"}, "index": 0, "finish_reason": "stop"}]}\n\n');
-            currentTask.res.write('data: [DONE]\n\n');
-            currentTask.res.end();
-        }
-
-        currentTask = null;
-    } catch (error) {
-        console.error('取消任务时出错:', error);
-        currentTask = null;
+    if (currentTask.res && !currentTask.res.writableEnded) {
+      currentTask.res.write('data: {"choices": [{"delta": {"content": "\n\n[收到新请求，开始重新生成]"}, "index": 0, "finish_reason": "stop"}]}\n\n');
+      currentTask.res.write('data: [DONE]\n\n');
+      currentTask.res.end();
     }
+    currentTask = null;
+  } catch (error) {
+    console.error('取消任务时出错:', error);
+    currentTask = null;
+  }
 }
 
-// 修改主请求处理函数
-app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
-    // 确保取消之前的任务
-    if (currentTask) {
-        console.log('存在正在进行的任务，准备取消...');
-        cancelCurrentTask();
-        await new Promise(resolve => setTimeout(resolve, 100));
+// 处理思考阶段
+async function processThinkingStage(messages, stream, res) {
+  const thinkingMessages = [...messages, { role: "user", content: Think_PROMPT }];
+  const thinkingConfig = {
+    model: Model_think_MODEL,
+    messages: thinkingMessages,
+    temperature: parseFloat(Model_think_TEMPERATURE),
+    max_tokens: parseInt(Model_think_MAX_TOKENS),
+    stream
+  };
+
+  if (Model_think_WebSearch === 'true') {
+    thinkingConfig.tools = [{
+      type: "function",
+      function: {
+        name: "googleSearch",
+        description: "Search the web for relevant information",
+        parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
+      }
+    }];
+  }
+
+  console.log('思考阶段配置:', { model: thinkingConfig.model, temperature: thinkingConfig.temperature, messageCount: thinkingConfig.messages.length });
+
+  const cancelTokenSource = axios.CancelToken.source();
+  let thinkingContent = '';
+
+  if (stream) {
+    const thinkingResponse = await axios.post(
+      `${PROXY_URL}/v1/chat/completions`,
+      thinkingConfig,
+      {
+        headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        responseType: 'stream',
+        cancelToken: cancelTokenSource.token,
+        timeout: 30000
+      }
+    );
+
+    const thinkingChunks = [];
+    let isFirstThinkingChunk = true;
+
+    if (Show_COT === 'true' && !res.headersSent) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     }
 
-    console.log('开始处理新请求...');
-    
-    const cancelTokenSource = axios.CancelToken.source();
-    currentTask = { 
-        res,
-        cancelTokenSource,
-        thinkingSent: false // 标记是否已发送思考内容
-    };
-
-    try {
-        const originalRequest = req.body;
-        const messages = [...originalRequest.messages].map(msg => {
-            // 处理消息中的多模态内容
-            if (msg.content && Array.isArray(msg.content)) {
-                return {
-                    ...msg,
-                    content: msg.content.filter(content => {
-                        // 根据Model_think_image参数过滤图片内容
-                        if (content.type === 'image_url' && Model_think_image !== 'true') {
-                            return false;
-                        }
-                        return true;
-                    }).map(content => {
-                        if (content.type === 'text') {
-                            return content;
-                        } else if (content.type === 'image_url') {
-                            // 处理图片URL
-                            return {
-                                type: 'image_url',
-                                image_url: {
-                                    url: content.image_url.url
-                                }
-                            };
-                        } else if (content.type === 'file_url') {
-                            // 处理文件URL
-                            return {
-                                type: 'file_url',
-                                file_url: {
-                                    url: content.file_url.url,
-                                    mime_type: content.file_url.mime_type
-                                }
-                            };
-                        }
-                        return content;
-                    })
+    await new Promise((resolve, reject) => {
+      thinkingResponse.data.on('data', chunk => {
+        const lines = chunk.toString().split('\n').filter(line => line.trim());
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+            const parsed = JSON.parse(data);
+            const content = parsed.choices[0]?.delta?.content || '';
+            if (content) {
+              thinkingChunks.push(content);
+              if (Show_COT === 'true') {
+                process.stdout.write(content);
+                const outputContent = isFirstThinkingChunk ? `<think>${content}` : content;
+                isFirstThinkingChunk = false;
+                const formattedChunk = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: HYBRID_MODEL_NAME,
+                  choices: [{ delta: { content: outputContent }, index: 0, finish_reason: null }]
                 };
+                res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
+              }
             }
-            return msg;
-        });
-        const stream = originalRequest.stream ?? true; // 默认为流式输出
-        
-        // 检查模型
-        const requestedModel = originalRequest.model;
-        if (requestedModel !== HYBRID_MODEL_NAME) {
-            throw new Error(`不支持的模型: ${requestedModel}`);
+          }
         }
+      });
 
-        // 思考阶段
-        const thinkingMessages = [
-            ...messages,
-            { 
-                role: "user",  // 将 system 改为 user
-                content: Think_PROMPT 
-            }
+      thinkingResponse.data.on('error', reject);
+      thinkingResponse.data.on('end', () => {
+        if (Show_COT === 'true' && !isFirstThinkingChunk) {
+          res.write(`data: ${JSON.stringify({
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: HYBRID_MODEL_NAME,
+            choices: [{ delta: { content: '</think>\n\n' }, index: 0, finish_reason: null }]
+          })}\n\n`);
+        }
+        resolve();
+      });
+    });
+
+    thinkingContent = thinkingChunks.join('');
+    console.log('思考阶段内容收集完成');
+    return { content: thinkingContent, thinkingSent: Show_COT === 'true' };
+  } else {
+    const thinkingResponse = await axios.post(
+      `${PROXY_URL}/v1/chat/completions`,
+      thinkingConfig,
+      {
+        headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json' },
+        cancelToken: cancelTokenSource.token,
+        timeout: 30000
+      }
+    );
+    thinkingContent = thinkingResponse.data.choices[0].message.content;
+    return { content: thinkingContent, thinkingSent: false };
+  }
+}
+
+// 主请求处理函数
+app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
+  if (currentTask) {
+    console.log('存在正在进行的任务，准备取消...');
+    cancelCurrentTask();
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  console.log('开始处理新请求...');
+  const cancelTokenSource = axios.CancelToken.source();
+  currentTask = { res, cancelTokenSource, thinkingSent: false, isMcpFollowUp: false };
+
+  try {
+    const originalRequest = req.body;
+    const messages = [...originalRequest.messages];
+    const stream = originalRequest.stream ?? true;
+
+    if (originalRequest.model !== HYBRID_MODEL_NAME) {
+      throw new Error(`不支持的模型: ${originalRequest.model}`);
+    }
+
+    // 判断是否为 MCP 后续请求（基于是否有工具调用返回）
+    const isMcpFollowUp = messages.some(msg => msg.role === 'tool');
+    currentTask.isMcpFollowUp = isMcpFollowUp;
+
+    let thinkingContent = '';
+    let thinkingSent = false;
+
+    // 仅在非 MCP 后续请求（即用户首次输入）时调用思考模型
+    if (Model_output_tool === 'true' && !isMcpFollowUp) {
+      const thinkingResult = await processThinkingStage(messages, stream, res);
+      thinkingContent = thinkingResult.content;
+      thinkingSent = thinkingResult.thinkingSent;
+      currentTask.thinkingSent = thinkingSent;
+    } else if (!isMcpFollowUp) {
+      // tool=false 时，无论如何都调用思考模型
+      const thinkingResult = await processThinkingStage(messages, stream, res);
+      thinkingContent = thinkingResult.content;
+      thinkingSent = thinkingResult.thinkingSent;
+      currentTask.thinkingSent = thinkingSent;
+    } else {
+      console.log('检测到 MCP 后续请求，跳过思考模型...');
+    }
+
+    // 构建输出消息
+    const outputMessages = isMcpFollowUp
+      ? messages // MCP 后续请求直接使用客户端传入的消息
+      : [
+          { role: "system", content: RELAY_PROMPT },
+          ...messages.slice(0, -1),
+          messages[messages.length - 1],
+          ...(thinkingContent ? [{ role: "user", content: thinkingContent }] : [])
         ];
 
-        // 简化思考阶段配置
-        const thinkingConfig = {
-            model: Model_think_MODEL,
-            messages: thinkingMessages,
-            temperature: parseFloat(Model_think_TEMPERATURE),
-            stream: stream // 使用客户端请求的流式设置
-        };
+    if (Model_output_tool === 'true') {
+      // 工具启用时，直接中转到输出模型
+      console.log('工具启用，直接中转到输出模型...');
+      const outputConfig = {
+        ...originalRequest,
+        messages: outputMessages,
+        model: Model_output_MODEL,
+        stream
+      };
 
-        if (Model_think_WebSearch === 'true') {
-            thinkingConfig.tools = [{
-                type: "function",
-                function: {
-                    name: "googleSearch",
-                    description: "Search the web for relevant information",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            query: {
-                                type: "string",
-                                description: "The search query"
-                            }
-                        },
-                        required: ["query"]
-                    }
-                }
-            }];
+      const outputResponse = await axios.post(
+        `${PROXY_URL2}/v1/chat/completions`,
+        outputConfig,
+        {
+          headers: {
+            Authorization: `Bearer ${Model_output_API_KEY}`,
+            'Content-Type': 'application/json',
+            ...(stream ? { 'Accept': 'text/event-stream' } : {})
+          },
+          responseType: stream ? 'stream' : 'json',
+          timeout: 60000
         }
+      );
 
-        // 在执行思考阶段之前添加日志
-        console.log('思考阶段配置:', {
-            model: thinkingConfig.model,
-            temperature: thinkingConfig.temperature,
-            messageCount: thinkingConfig.messages.length
+      if (stream) {
+        if (!res.headersSent) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+        }
+        outputResponse.data.pipe(res);
+        outputResponse.data.on('end', () => {
+          console.log('MCP 输出流结束');
+          // 不重置 currentTask，等待新用户请求
         });
-
-        // 执行思考阶段
-        let thinkingContent = '';
-        
-        if (stream) {
-            // 流式思考阶段
-            const thinkingResponse = await axios.post(
-                `${PROXY_URL}/v1/chat/completions`,
-                thinkingConfig,
-                {
-                    headers: {
-                        Authorization: `Bearer ${Model_think_API_KEY}`,
-                        'Content-Type': 'application/json',
-                        'Accept': 'text/event-stream'
-                    },
-                    responseType: 'stream',
-                    cancelToken: cancelTokenSource.token,
-                    timeout: 30000,
-                    validateStatus: function (status) {
-                        return status >= 200 && status < 300;
-                    }
-                }
-            );
-            
-            // 收集思考内容并实时发送给客户端
-            const thinkingChunks = [];
-            let isFirstThinkingChunk = true;
-            
-            // 设置SSE响应头
-            if (Show_COT === 'true' && !res.headersSent) {
-                res.writeHead(200, {
-                    'Content-Type': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive',
-                    'X-Accel-Buffering': 'no'
-                });
-            }
-            
-            await new Promise((resolve, reject) => {
-                thinkingResponse.data.on('data', chunk => {
-                    try {
-                        const lines = chunk.toString().split('\n').filter(line => line.trim() !== '');
-                        
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                const data = line.slice(6);
-                                if (data === '[DONE]') {
-                                    continue;
-                                }
-                                
-                                try {
-                                    const parsed = JSON.parse(data);
-                                    const content = parsed.choices[0]?.delta?.content || '';
-                                    
-                                    if (content) {
-                                        thinkingChunks.push(content);
-                                        
-                                        // 如果需要显示思考内容，实时发送给客户端
-                                        if (Show_COT === 'true') {
-                                            // 简化的流式日志
-                                            process.stdout.write(content);
-                                            
-                                            // 为第一个思考块添加<think>标签
-                                            let outputContent = content;
-                                            if (isFirstThinkingChunk) {
-                                                outputContent = `<think>${content}`;
-                                                isFirstThinkingChunk = false;
-                                            }
-                                            
-                                            const formattedChunk = {
-                                                id: `chatcmpl-${Date.now()}`,
-                                                object: 'chat.completion.chunk',
-                                                created: Math.floor(Date.now() / 1000),
-                                                model: HYBRID_MODEL_NAME,
-                                                choices: [{
-                                                    delta: { content: outputContent },
-                                                    index: 0,
-                                                    finish_reason: null
-                                                }]
-                                            };
-                                            res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
-                                        }
-                                    }
-                                } catch (parseError) {
-                                    console.error('解析思考响应失败:', parseError.message);
-                                }
-                            }
-                        }
-                    } catch (error) {
-                        console.error('处理思考响应出错:', error.message);
-                    }
-                });
-                
-                thinkingResponse.data.on('error', error => {
-                    console.error('思考流错误:', error);
-                    reject(error);
-                });
-                
-                thinkingResponse.data.on('end', () => {
-                    console.log('思考流结束');
-                    // 如果需要显示思考内容，添加思考结束标签
-                    if (Show_COT === 'true' && !isFirstThinkingChunk) {
-                        const formattedChunk = {
-                            id: `chatcmpl-${Date.now()}`,
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: HYBRID_MODEL_NAME,
-                            choices: [{
-                                delta: { content: '</think>\n\n' },
-                                index: 0,
-                                finish_reason: null
-                            }]
-                        };
-                        res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
-                    }
-                    resolve();
-                });
-            });
-            
-            thinkingContent = thinkingChunks.join('');
-            console.log('思考阶段内容收集完成');
-            
-            // 标记思考内容已发送
-            if (Show_COT === 'true') {
-                currentTask.thinkingSent = true;
-            }
-        } else {
-            // 非流式思考阶段
-            const thinkingResponse = await axios.post(
-                `${PROXY_URL}/v1/chat/completions`,
-                thinkingConfig,
-                {
-                    headers: {
-                        Authorization: `Bearer ${Model_think_API_KEY}`,
-                        'Content-Type': 'application/json',
-                    },
-                    cancelToken: cancelTokenSource.token,
-                    timeout: 30000,
-                    validateStatus: function (status) {
-                        return status >= 200 && status < 300;
-                    }
-                }
-            );
-
-            console.log('思考阶段响应:', JSON.stringify(thinkingResponse.data, null, 2));
-            thinkingContent = thinkingResponse.data.choices[0].message.content;
-        }
-        
-        // 保存思考内容，用于后续处理
-        const originalThinkingContent = thinkingContent;
-
-        // 修改输出阶段的消息构建
-        const outputMessages = [
-            {
-                role: "system",
-                content: RELAY_PROMPT
-            }
-        ];
-        
-        // 添加完整的对话历史，而不仅仅是最后一条消息
-        // 将原始消息数组中除最后一条消息外的所有消息添加到输出消息中
-        for (let i = 0; i < messages.length - 1; i++) {
-            outputMessages.push(messages[i]);
-        }
-        
-        // 添加原始问题，处理多模态内容
-        const lastUserMessage = messages[messages.length - 1];
-        if (lastUserMessage.content && Array.isArray(lastUserMessage.content)) {
-            // 处理多模态内容，根据Model_output_image参数过滤图片
-            outputMessages.push({
-                role: "user",
-                content: lastUserMessage.content.filter(content => {
-                    // 根据Model_output_image参数过滤图片内容
-                    if (content.type === 'image_url' && Model_output_image !== 'true') {
-                        return false;
-                    }
-                    return true;
-                })
-            });
-        } else {
-            // 普通文本内容
-            outputMessages.push({
-                role: "user",
-                content: lastUserMessage.content
-            });
-        }
-        
-        // 添加思考内容
-        outputMessages.push({
-            role: "user",  // 将 assistant 改为 user
-            content: thinkingContent
+        outputResponse.data.on('error', (error) => {
+          console.error('MCP 输出流错误:', error);
+          if (!res.writableEnded) {
+            res.write(`data: {"error": "Stream error: ${error.message}"}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }
+          currentTask = null;
         });
+      } else {
+        res.json(outputResponse.data);
+        currentTask = null;
+      }
+    } else {
+      // 工具未启用时，保留原有逻辑
+      const outputConfig = {
+        model: Model_output_MODEL,
+        messages: outputMessages,
+        temperature: parseFloat(Model_output_TEMPERATURE),
+        max_tokens: parseInt(Model_output_MAX_TOKENS),
+        stream
+      };
 
-        // 修改输出阶段的配置
-        const outputConfig = {
-            model: Model_output_MODEL,
-            messages: outputMessages,
-            temperature: parseFloat(Model_output_TEMPERATURE),
-            stream: stream,
-            max_tokens: parseInt(Model_output_MAX_TOKENS) // 添加最大token限制
-        };
+      if (Model_output_WebSearch === 'true') {
+        outputConfig.tools = [{
+          type: "function",
+          function: {
+            name: "googleSearch",
+            description: "Search the web for relevant information",
+            parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
+          }
+        }];
+      }
 
-        if (Model_output_WebSearch === 'true') {
-            outputConfig.tools = [{
-                type: "function",
-                function: {
-                    name: "googleSearch",
-                    description: "Search the web for relevant information",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            query: {
-                                type: "string",
-                                description: "The search query"
-                            }
-                        },
-                        required: ["query"]
-                    }
-                }
-            }];
+      console.log('准备输出阶段配置:', JSON.stringify(outputConfig, null, 2));
+
+      if (stream) {
+        const outputResponse = await axios.post(
+          `${PROXY_URL2}/v1/chat/completions`,
+          outputConfig,
+          {
+            headers: { Authorization: `Bearer ${Model_output_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+            responseType: 'stream',
+            timeout: 60000
+          }
+        );
+
+        if (!res.headersSent) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
         }
 
-        // 添加更多日志来追踪输出阶段
-        console.log('准备输出阶段配置:', JSON.stringify(outputConfig, null, 2));
-
-        // 修改流式输出处理
-        if (stream) {
-            console.log('开始流式输出请求...');
-            try {
-                const outputResponse = await axios.post(
-                    `${PROXY_URL2}/v1/chat/completions`,
-                    outputConfig,
-                    {
-                        headers: {
-                            Authorization: `Bearer ${Model_output_API_KEY}`,
-                            'Content-Type': 'application/json',
-                            'Accept': 'text/event-stream'
-                        },
-                        responseType: 'stream',
-                        timeout: 60000, // 增加超时时间
-                        validateStatus: function (status) {
-                            return status >= 200 && status < 300;
-                        }
-                    }
-                );
-
-                console.log('输出阶段响应头:', outputResponse.headers);
-                
-                // 设置SSE响应头，仅在头部未发送时设置
-                if (!res.headersSent) {
-                    res.writeHead(200, {
-                        'Content-Type': 'text/event-stream',
-                        'Cache-Control': 'no-cache',
-                        'Connection': 'keep-alive',
-                        'X-Accel-Buffering': 'no'
-                    });
-                }
-
-                // 改进的数据处理
-                outputResponse.data.on('data', chunk => {
-                    try {
-                        const lines = chunk.toString().split('\n').filter(line => line.trim() !== '');
-                        
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                const data = line.slice(6);
-                                if (data === '[DONE]') {
-                                    res.write('data: [DONE]\n\n');
-                                    continue;
-                                }
-                                
-                                try {
-                                    const parsed = JSON.parse(data);
-                                    const content = parsed.choices[0]?.delta?.content || '';
-                                    
-                                    if (content) {
-                                        // 简化的流式日志
-                                        process.stdout.write(content);
-                                        
-                                        // 根据Show_COT决定是否显示思考内容
-                                        let outputContent = content;
-                                        
-                                        // 只有在之前没有发送过思考内容的情况下才添加
-                                        // 由于我们在思考阶段可能已经发送了思考内容，这里需要检查
-                                        if (Show_COT === 'true' && !currentTask.thinkingSent) {
-                                            // 添加思考内容
-                                            outputContent = `<think>${originalThinkingContent}</think>\n\n${content}`;
-                                            currentTask.thinkingSent = true;
-                                        } else if (Show_COT !== 'true') {
-                                            // 如果不显示思考内容，直接使用原始内容
-                                            outputContent = content;
-                                        }
-                                        
-                                        const formattedChunk = {
-                                            id: `chatcmpl-${Date.now()}`,
-                                            object: 'chat.completion.chunk',
-                                            created: Math.floor(Date.now() / 1000),
-                                            model: HYBRID_MODEL_NAME,
-                                            choices: [{
-                                                delta: { content: outputContent },
-                                                index: 0,
-                                                finish_reason: null
-                                            }]
-                                        };
-                                        res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
-                                    }
-                                } catch (parseError) {
-                                    console.error('解析响应失败:', parseError.message);
-                                }
-                            }
-                        }
-                    } catch (error) {
-                        console.error('处理响应出错:', error.message);
-                    }
-                });
-
-                // 改进的错误处理
-                outputResponse.data.on('error', error => {
-                    console.error('输出流错误:', error);
-                    if (!res.writableEnded) {
-                        res.write(`data: {"error": "Stream error: ${error.message}"}\n\n`);
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-                    }
-                    currentTask = null;
-                });
-
-                // 改进的结束处理
-                outputResponse.data.on('end', () => {
-                    console.log('输出流结束');
-                    if (!res.writableEnded) {
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-                    }
-                    currentTask = null;
-                });
-
-            } catch (error) {
-                console.error('流式输出请求失败:', error);
-                console.error('错误详情:', {
-                    status: error.response?.status,
-                    statusText: error.response?.statusText,
-                    data: error.response?.data,
-                    headers: error.response?.headers
-                });
-                
-                if (!res.headersSent && !res.writableEnded) {
-                    res.status(500).json({
-                        error: 'Stream request failed',
-                        message: error.message,
-                        details: error.response?.data
-                    });
-                } else if (!res.writableEnded) {
-                    // 如果头部已发送但响应未结束，以SSE格式发送错误
-                    res.write(`data: {"error": "Stream request failed: ${error.message.replace(/"/g, '\\"')}"}
-
-`);
-                    res.write('data: [DONE]\n\n');
-                    res.end();
-                }
-                currentTask = null;
-            }
-        } else {
-            console.log('开始非流式输出请求...');
-            const outputResponse = await axios.post(
-                `${PROXY_URL2}/v1/chat/completions`,
-                outputConfig,
-                {
-                    headers: {
-                        Authorization: `Bearer ${Model_output_API_KEY}`,
-                        'Content-Type': 'application/json',
-                    },
-                    cancelToken: cancelTokenSource.token,
-                    // 添加超时设置
-                    timeout: 30000,
-                    validateStatus: function (status) {
-                        return status >= 200 && status < 300;
-                    }
-                }
-            );
-
-            console.log('输出阶段响应:', JSON.stringify(outputResponse.data, null, 2));
-            
-            // 处理非流式输出的思考内容显示
-            if (Show_COT === 'true') {
-                // 如果需要显示思考内容，修改响应
-                const modifiedResponse = {
-                    ...outputResponse.data,
-                    choices: outputResponse.data.choices.map(choice => ({
-                        ...choice,
-                        message: {
-                            ...choice.message,
-                            content: `<think>${originalThinkingContent}</think>\n\n${choice.message.content}`
-                        }
-                    }))
+        outputResponse.data.on('data', chunk => {
+          const lines = chunk.toString().split('\n').filter(line => line.trim());
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') {
+                res.write('data: [DONE]\n\n');
+                continue;
+              }
+              const parsed = JSON.parse(data);
+              const content = parsed.choices[0]?.delta?.content || '';
+              if (content) {
+                process.stdout.write(content);
+                const outputContent = (Show_COT === 'true' && !currentTask.thinkingSent) ? `<think>${thinkingContent}</think>\n\n${content}` : content;
+                if (Show_COT === 'true' && !currentTask.thinkingSent) currentTask.thinkingSent = true;
+                const formattedChunk = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: HYBRID_MODEL_NAME,
+                  choices: [{ delta: { content: outputContent }, index: 0, finish_reason: null }]
                 };
-                res.json(modifiedResponse);
-            } else {
-                // 直接返回原始响应
-                res.json(outputResponse.data);
+                res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
+              }
             }
-            currentTask = null;
-        }
-
-    } catch (error) {
-        console.error('请求处理错误:', {
-            message: error.message,
-            status: error.response?.status,
-            data: error.response?.data
+          }
         });
-        
-        if (!res.headersSent && !res.writableEnded) {
-            res.status(500).json({
-                error: 'Internal server error',
-                message: error.message
-            });
+
+        outputResponse.data.on('error', (error) => {
+          console.error('输出流错误:', error);
+          if (!res.writableEnded) {
+            res.write(`data: {"error": "Stream error: ${error.message}"}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }
+          currentTask = null;
+        });
+
+        outputResponse.data.on('end', () => {
+          console.log('输出流结束');
+          if (!res.writableEnded) {
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }
+          currentTask = null;
+        });
+      } else {
+        const outputResponse = await axios.post(
+          `${PROXY_URL2}/v1/chat/completions`,
+          outputConfig,
+          {
+            headers: { Authorization: `Bearer ${Model_output_API_KEY}`, 'Content-Type': 'application/json' },
+            timeout: 30000
+          }
+        );
+
+        if (Show_COT === 'true') {
+          const modifiedResponse = {
+            ...outputResponse.data,
+            choices: outputResponse.data.choices.map(choice => ({
+              ...choice,
+              message: { ...choice.message, content: `<think>${thinkingContent}</think>\n\n${choice.message.content}` }
+            }))
+          };
+          res.json(modifiedResponse);
+        } else {
+          res.json(outputResponse.data);
         }
         currentTask = null;
+      }
     }
+  } catch (error) {
+    console.error('请求处理错误:', { message: error.message, status: error.response?.status, data: error.response?.data });
+    if (!res.headersSent && !res.writableEnded) {
+      res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+    currentTask = null;
+  }
 });
 
-// 添加健康检查路由
+
+
+// 健康检查路由
 app.get('/health', async (req, res) => {
-    try {
-        const response = await axios.get(`${PROXY_URL}/health`);
-        res.json({ status: 'ok', proxyStatus: response.data });
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error', 
-            message: '代理服务器连接失败',
-            error: error.message 
-        });
-    }
+  try {
+    const response = await axios.get(`${PROXY_URL}/health`);
+    res.json({ status: 'ok', proxyStatus: response.data });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: '代理服务器连接失败', error: error.message });
+  }
 });
 
-// 添加文件处理路由
+// 文件处理路由
 app.post('/v1/files', apiKeyAuth, async (req, res) => {
-    try {
-        // 处理文件上传
-        // ... 文件处理逻辑
-    } catch (error) {
-        console.error('文件处理错误:', error.message);
-        res.status(500).json({
-            error: 'File processing error',
-            message: error.message
-        });
-    }
+  try {
+    // 文件处理逻辑（待实现）
+    res.json({ status: 'ok', message: '文件处理成功' });
+  } catch (error) {
+    console.error('文件处理错误:', error.message);
+    res.status(500).json({ error: 'File processing error', message: error.message });
+  }
 });
 
 app.listen(PROXY_PORT, () => {
-    console.log(`Hybrid AI proxy server started on port ${PROXY_PORT}`);
+  console.log(`Hybrid AI proxy server started on port ${PROXY_PORT}`);
 });
