@@ -67,9 +67,27 @@ function cancelCurrentTask() {
   }
 }
 
+// 过滤图片内容的辅助函数
+function filterImageContent(messages, allowImage) {
+  if (!allowImage) {
+    return messages.map(msg => {
+      if (msg.content && typeof msg.content === 'string' && msg.content.includes('data:image/')) {
+        return {
+          ...msg,
+          content: msg.content.replace(/data:image\/[^;]+;base64,[^\s"]+/g, '[图片内容已过滤]')
+        };
+      }
+      return msg;
+    });
+  }
+  return messages;
+}
+
 // 处理思考阶段
 async function processThinkingStage(messages, stream, res) {
-  const thinkingMessages = [...messages, { role: "user", content: Think_PROMPT }];
+  // 根据Model_think_image配置过滤图片内容
+  const filteredMessages = filterImageContent(messages, Model_think_image === 'true');
+  const thinkingMessages = [...filteredMessages, { role: "user", content: Think_PROMPT }];
   const thinkingConfig = {
     model: Model_think_MODEL,
     messages: thinkingMessages,
@@ -189,7 +207,8 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
 
   try {
     const originalRequest = req.body;
-    const messages = [...originalRequest.messages];
+    // 根据Model_output_image配置过滤图片内容
+    const messages = filterImageContent([...originalRequest.messages], Model_output_image === 'true');
     const stream = originalRequest.stream ?? true;
 
     if (originalRequest.model !== HYBRID_MODEL_NAME) {
