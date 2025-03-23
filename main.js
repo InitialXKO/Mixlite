@@ -71,11 +71,26 @@ function cancelCurrentTask() {
 function filterImageContent(messages, allowImage) {
   if (!allowImage) {
     return messages.map(msg => {
-      if (msg.content && typeof msg.content === 'string' && msg.content.includes('data:image/')) {
-        return {
-          ...msg,
-          content: msg.content.replace(/data:image\/[^;]+;base64,[^\s"]+/g, '[图片内容已过滤]')
-        };
+      if (msg.content) {
+        if (typeof msg.content === 'string' && msg.content.includes('data:image/')) {
+          return {
+            ...msg,
+            content: msg.content.replace(/data:image\/[^;]+;base64,[^\s"]+/g, '[图片内容已过滤]')
+          };
+        } else if (typeof msg.content === 'object') {
+          // 处理结构化数据中的image_url
+          const parts = Array.isArray(msg.content) ? msg.content : [msg.content];
+          const filteredParts = parts.map(part => {
+            if (part.type === 'image_url' || part.image_url) {
+              return { type: 'text', text: '[图片URL已过滤]' };
+            }
+            return part;
+          });
+          return {
+            ...msg,
+            content: Array.isArray(msg.content) ? filteredParts : filteredParts[0]
+          };
+        }
       }
       return msg;
     });
