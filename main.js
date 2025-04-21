@@ -111,6 +111,13 @@ async function processThinkingStage(messages, stream, res) {
     stream
   };
 
+  // Conditionally add config for specific models
+  if (Model_think_MODEL === 'gemini-2.5-flash-preview-04-17') {
+    thinkingConfig.config = {
+      thinkingConfig: { thinkingBudget: 24576 } // Correct structure: config -> thinkingConfig
+    };
+  }
+
   if (Model_think_WebSearch === 'true') {
     thinkingConfig.tools = [{
       type: "function",
@@ -135,7 +142,7 @@ async function processThinkingStage(messages, stream, res) {
         headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
         responseType: 'stream',
         cancelToken: cancelTokenSource.token,
-        timeout: 30000
+        timeout: 90000
       }
     );
 
@@ -200,7 +207,7 @@ async function processThinkingStage(messages, stream, res) {
       {
         headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json' },
         cancelToken: cancelTokenSource.token,
-        timeout: 30000
+        timeout: 90000
       }
     );
     thinkingContent = thinkingResponse.data.choices[0].message.content;
