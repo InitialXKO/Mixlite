@@ -30,7 +30,8 @@ const {
   RELAY_PROMPT,
   HYBRID_MODEL_NAME,
   OUTPUT_API_KEY,
-  Show_COT
+  Show_COT,
+  LOG_FULL_CONTENT // New environment variable for full content logging
 } = process.env;
 
 
@@ -129,24 +130,25 @@ async function processThinkingStage(messages, stream, res) {
     }];
   }
 
-  console.log('思考阶段配置:', { model: thinkingConfig.model, temperature: thinkingConfig.temperature, messageCount: thinkingConfig.messages.length });
+  console.log('[INFO] 思考阶段配置:', { model: thinkingConfig.model, temperature: thinkingConfig.temperature, max_tokens: thinkingConfig.max_tokens, stream: thinkingConfig.stream, messageCount: thinkingConfig.messages.length });
 
   const cancelTokenSource = axios.CancelToken.source();
   let thinkingContent = '';
 
-  if (stream) {
-    const thinkingResponse = await axios.post(
-      `${PROXY_URL}/v1/chat/completions`,
-      thinkingConfig,
-      {
-        headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-        responseType: 'stream',
-        cancelToken: cancelTokenSource.token,
-        timeout: 90000
-      }
-    );
+  try { // Add try block for thinking stage API call
+    if (stream) {
+      const thinkingResponse = await axios.post(
+        `${PROXY_URL}/v1/chat/completions`,
+        thinkingConfig,
+        {
+          headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+          responseType: 'stream',
+          cancelToken: cancelTokenSource.token,
+          timeout: 90000
+        }
+      );
 
-    const thinkingChunks = [];
+      const thinkingChunks = [];
     let isFirstThinkingChunk = true;
 
     if (Show_COT === 'true' && !res.headersSent) {
@@ -197,21 +199,45 @@ async function processThinkingStage(messages, stream, res) {
       });
     });
 
-    thinkingContent = thinkingChunks.join('');
-    console.log('思考阶段内容收集完成');
-    return { content: thinkingContent, thinkingSent: Show_COT === 'true' };
-  } else {
-    const thinkingResponse = await axios.post(
-      `${PROXY_URL}/v1/chat/completions`,
-      thinkingConfig,
-      {
-        headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json' },
-        cancelToken: cancelTokenSource.token,
-        timeout: 90000
+      thinkingContent = thinkingChunks.join('');
+      console.log('思考阶段内容收集完成');
+      return { content: thinkingContent, thinkingSent: Show_COT === 'true' };
+    } else { // Non-stream for thinking stage
+      const thinkingResponse = await axios.post(
+        `${PROXY_URL}/v1/chat/completions`,
+        thinkingConfig,
+        {
+          headers: { Authorization: `Bearer ${Model_think_API_KEY}`, 'Content-Type': 'application/json' },
+          cancelToken: cancelTokenSource.token,
+          timeout: 90000
+        }
+      );
+      thinkingContent = thinkingResponse.data.choices[0].message.content;
+      console.log('思考阶段内容收集完成 (非流式)');
+      if (LOG_FULL_CONTENT === 'true') {
+        console.log('[INFO] 思考模型完整输出 (thinkingContent):\n', thinkingContent || '[无内容]');
+      } else {
+        console.log(`[INFO] 思考模型输出 (thinkingContent) 长度: ${thinkingContent?.length || 0}`);
+        if (thinkingContent?.length > 200) {
+          console.log(`[INFO] 思考模型输出 (摘要): ${thinkingContent.substring(0, 100)}...${thinkingContent.substring(thinkingContent.length - 100)}`);
+        } else if (thinkingContent) {
+          console.log(`[INFO] 思考模型输出: ${thinkingContent}`);
+        }
       }
-    );
-    thinkingContent = thinkingResponse.data.choices[0].message.content;
-    return { content: thinkingContent, thinkingSent: false };
+      return { content: thinkingContent, thinkingSent: false };
+    }
+  } catch (error) {
+    console.error('思考阶段 API 调用失败:', {
+      message: error.message,
+      url: `${PROXY_URL}/v1/chat/completions`,
+      request_model: thinkingConfig.model,
+      status: error.response?.status,
+      data: error.response?.data
+    });
+    // Return empty content or re-throw, depending on desired behavior
+    // For now, let's return empty so the main flow can continue, but log indicates failure
+    console.log('[INFO] 思考模型阶段因错误返回空内容。');
+    return { content: '', thinkingSent: false };
   }
 }
 
@@ -231,8 +257,8 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
     const originalRequest = req.body;
     // 根据Model_output_image配置过滤图片内容
     const messages = filterImageContent([...originalRequest.messages], Model_output_image === 'true');
-    const stream = originalRequest.stream ?? true;
-
+    const stream = originalRequest.stream ?? false; // Changed default to false to align with OpenAI and fix newapi issue
+  
     if (originalRequest.model !== HYBRID_MODEL_NAME) {
       throw new Error(`不支持的模型: ${originalRequest.model}`);
     }
@@ -269,16 +295,40 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
           messages[messages.length - 1],
           ...(thinkingContent ? [{ role: "user", content: thinkingContent }] : [])
         ];
+    console.log(`[INFO] 构建的输出模型消息 (outputMessages) 条数: ${outputMessages.length}`);
+    outputMessages.forEach((msg, index) => {
+      let contentToLog = '';
+      if (typeof msg.content === 'string') {
+        if (LOG_FULL_CONTENT === 'true' || msg.role !== 'user' || msg.content !== thinkingContent) { // Log system/assistant messages fully, and user messages if not the long thinkingContent
+          contentToLog = (LOG_FULL_CONTENT === 'true' || msg.content.length <= 200) ? msg.content : `${msg.content.substring(0,100)}...${msg.content.substring(msg.content.length-100)} (长度: ${msg.content.length})`;
+        } else { // It's thinkingContent for user role, and full logging is off
+            contentToLog = `[思考链内容，长度: ${msg.content.length}]`;
+        }
+      } else if (Array.isArray(msg.content)) {
+        contentToLog = LOG_FULL_CONTENT === 'true' ? JSON.stringify(msg.content) : `Array of ${msg.content.length} parts. First part type: ${msg.content[0]?.type}`;
+      } else {
+        contentToLog = '[非文本内容或内容为空]';
+      }
+      console.log(`[INFO] outputMessages[${index}]: role=${msg.role}, content = ${contentToLog}`);
+    });
 
     if (Model_output_tool === 'true') {
       // 工具启用时，直接中转到输出模型
-      console.log('工具启用，直接中转到输出模型...');
+      console.log('[INFO] 工具启用，直接中转到输出模型 (Model_output_tool === true)...');
       const outputConfig = {
         ...originalRequest,
         messages: outputMessages,
         model: Model_output_MODEL,
         stream
       };
+      // Log outputConfig without sensitive keys
+      const {messages: _, ...loggableOutputConfig} = outputConfig; // Exclude full messages from this specific log line for brevity if already logged
+      if (loggableOutputConfig.body && typeof loggableOutputConfig.body === 'object') { // handle potential nested body
+           const {apiKey: __, ...loggableBody} = loggableOutputConfig.body;
+           loggableOutputConfig.body = loggableBody;
+      }
+      console.log('[INFO] 输出模型配置 (outputConfig 摘要):', JSON.stringify({model: loggableOutputConfig.model, stream: loggableOutputConfig.stream, temperature: outputMessages.find(m=>m.role==='system') ? Model_output_TEMPERATURE : originalRequest.temperature , max_tokens: outputMessages.find(m=>m.role==='system') ? Model_output_MAX_TOKENS : originalRequest.max_tokens}));
+
 
       const outputResponse = await axios.post(
         `${PROXY_URL2}/v1/chat/completions`,
@@ -295,6 +345,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
       );
 
       if (stream) {
+        let accumulatedStreamContent = ''; // Variable to accumulate stream content for logging
         if (!res.headersSent) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
         }
@@ -317,6 +368,10 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
                 const content = delta && delta.content;
                 const finish_reason = choice && choice.finish_reason;
 
+                if (LOG_FULL_CONTENT === 'true' && content) {
+                  accumulatedStreamContent += content;
+                }
+
                 const formattedChunk = {
                   id: parsed.id || `chatcmpl-${Date.now()}`,
                   object: 'chat.completion.chunk',
@@ -329,29 +384,23 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
                   }]
                 };
                 res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
-              } catch (e) {
-                // 如果原始数据不是JSON，或者格式不对，尝试直接透传内容，或者记录错误
-                // console.warn('MCP stream chunk parsing error or not OpenAI format, attempting passthrough for content:', line);
-                // Fallback: if it's not a parsable JSON, but contains content, wrap it.
-                // This part might need adjustment based on actual PROXY_URL2 stream format.
-                // For now, if it's not OpenAI like, we'll assume it's raw content for simplicity.
-                // A more robust solution would check the actual format of PROXY_URL2's stream.
-                if (!line.includes('[DONE]') && !line.includes('error')) {
-                   const fallbackChunk = {
-                    id: `chatcmpl-${Date.now()}`,
+              } catch (parseError) {
+                console.error('MCP stream chunk parsing error:', parseError.message, 'Problematic line:', line);
+                if (!res.writableEnded) {
+                  const errorChunk = {
+                    id: `chatcmpl-err-${Date.now()}`,
                     object: 'chat.completion.chunk',
                     created: Math.floor(Date.now() / 1000),
                     model: HYBRID_MODEL_NAME,
-                    choices: [{ delta: { content: line.replace(/^data: /, '') }, index: 0, finish_reason: null }]
+                    choices: [{
+                      delta: { content: `\n\n[MixLite Error: Failed to parse upstream data. Original line: ${line.replace(/^data: /, '')}]` },
+                      index: 0,
+                      finish_reason: 'error'
+                    }]
                   };
-                  // res.write(`data: ${JSON.stringify(fallbackChunk)}\n\n`);
-                  // More safely, if we can't parse it as OpenAI, we should indicate an error or adapt.
-                  // For now, let's assume PROXY_URL2 sends OpenAI compatible chunks. If not, this needs rework.
-                  console.error('MCP stream chunk is not in expected OpenAI format and could not be parsed:', line);
-                  // To avoid breaking client, send an error chunk or handle gracefully
-                  // For now, we will assume valid OpenAI chunks from the upstream.
-                } else if (line.includes('[DONE]')) {
-                    res.write('data: [DONE]\n\n');
+                  res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                  res.write('data: [DONE]\n\n');
+                  res.end();
                 }
               }
             }
@@ -359,12 +408,24 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
         });
         outputResponse.data.on('end', () => {
           console.log('MCP 输出流结束');
-          if (!res.writableEnded) {
-             // Ensure [DONE] is sent if not already sent by a chunk
-            // res.write('data: [DONE]\n\n'); // This might be redundant if last chunk sends it
-            // res.end(); // End is handled by the main try/catch or if stream ends properly
+          if (LOG_FULL_CONTENT === 'true') {
+            console.log('[INFO] 输出模型完整流式响应内容 (accumulated):\n', accumulatedStreamContent || '[无累积内容]');
           }
-          // 不重置 currentTask，等待新用户请求
+          // console.log(`[DEBUG] MCP on('end'): res.writableEnded = ${res.writableEnded}, res.headersSent = ${res.headersSent}, res.finished = ${res.finished}`); // DEBUG Removed
+          if (!res.writableEnded && !res.finished) {
+            // console.log('[DEBUG] MCP on(\'end\'): Writing [DONE] and ending response.'); // DEBUG Removed
+            try {
+              res.write('data: [DONE]\n\n');
+              res.end();
+              // console.log(`[DEBUG] MCP on('end'): After res.end() call, res.writableEnded = ${res.writableEnded}, res.finished = ${res.finished}`); // DEBUG Removed
+            } catch (endError) {
+              console.error('[ERROR] MCP on(\'end\'): Error during res.end():', endError.message); // Kept as ERROR if it occurs
+            }
+          } else {
+            // console.log(`[DEBUG] MCP on('end'): Response already ended or not writable (writableEnded=${res.writableEnded}, finished=${res.finished}), not calling res.end() again.`); // DEBUG Removed
+          }
+          // 在流式请求正常结束后，也应该清空 currentTask
+          currentTask = null;
         });
         outputResponse.data.on('error', (error) => {
           console.error('MCP 输出流错误:', error);
@@ -397,13 +458,22 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
           choices: [{
             message: {
               role: 'assistant',
-              content: content || ''
+              content: content || '[内容为空或未返回]' // Ensure content is explicitly marked if null/undefined
             },
             index: 0,
             finish_reason: finish_reason || 'stop' // Default to stop if not provided
           }],
           usage: rawResponseData.usage // Preserve usage statistics if available
         };
+        console.log('[INFO] 输出模型原始响应内容 (rawResponseData.choices[0].message.content):', content || "[无内容]");
+        console.log('[INFO] 输出模型使用情况 (rawResponseData.usage):', rawResponseData.usage || "[无使用情况]");
+        console.log('[INFO] 最终发送给客户端的非流式响应 (formattedResponse 摘要):', { id: formattedResponse.id, model: formattedResponse.model, choices: [{ message: { role: 'assistant', content_length: formattedResponse.choices[0].message.content?.length || 0 }, finish_reason: formattedResponse.choices[0].finish_reason }], usage: formattedResponse.usage });
+        if (LOG_FULL_CONTENT === 'true') {
+          console.log('[INFO] 输出模型完整响应内容 (content):\n', content || "[内容为空或未返回]");
+        } else {
+          console.log('[INFO] 输出模型响应内容 (content 摘要):', content && content.length > 200 ? `${content.substring(0,100)}... (长度: ${content.length})` : (content || "[内容为空或未返回]"));
+        }
+        // The existing log for formattedResponse summary is good.
         res.json(formattedResponse);
         currentTask = null;
       }
@@ -431,6 +501,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
       console.log('准备输出阶段配置:', JSON.stringify(outputConfig, null, 2));
 
       if (stream) {
+        let accumulatedStreamContent_tool_false = ''; // For Model_output_tool === false branch
         const outputResponse = await axios.post(
           `${PROXY_URL2}/v1/chat/completions`,
           outputConfig,
@@ -460,6 +531,9 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
               const content = delta && delta.content;
               const finish_reason = choice && choice.finish_reason; // Extract finish_reason
 
+              if (LOG_FULL_CONTENT === 'true' && content) {
+                accumulatedStreamContent_tool_false += content;
+              }
               // Send chunk if there's content OR if it's the final chunk with a finish_reason
               if (content || finish_reason) {
                 if (content) { // Only write to stdout if there is actual content
@@ -504,6 +578,9 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
 
         outputResponse.data.on('end', () => {
           console.log('输出流结束');
+          if (LOG_FULL_CONTENT === 'true') {
+            console.log('[INFO] 输出模型完整流式响应内容 (accumulated, tool_false branch):\n', accumulatedStreamContent_tool_false || '[无累积内容]');
+          }
           if (!res.writableEnded) {
             res.write('data: [DONE]\n\n');
             res.end();
