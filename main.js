@@ -298,22 +298,113 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
         if (!res.headersSent) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
         }
-        outputResponse.data.pipe(res);
+        // outputResponse.data.pipe(res); // 修改：不再直接pipe
+        outputResponse.data.on('data', chunk => {
+          const lines = chunk.toString().split('\n').filter(line => line.trim());
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') {
+                res.write('data: [DONE]\n\n');
+                continue;
+              }
+              try {
+                const parsed = JSON.parse(data);
+                // 假设原始chunk已经是OpenAI兼容格式，如果不是，需要在这里构造
+                // 为了通用性，我们重新构造它，确保字段正确
+                const choice = parsed.choices && parsed.choices[0];
+                const delta = choice && choice.delta;
+                const content = delta && delta.content;
+                const finish_reason = choice && choice.finish_reason;
+
+                const formattedChunk = {
+                  id: parsed.id || `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion.chunk',
+                  created: parsed.created || Math.floor(Date.now() / 1000),
+                  model: HYBRID_MODEL_NAME, // 使用混合模型名称
+                  choices: [{
+                    delta: content ? { content } : {},
+                    index: 0,
+                    finish_reason: finish_reason || null
+                  }]
+                };
+                res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
+              } catch (e) {
+                // 如果原始数据不是JSON，或者格式不对，尝试直接透传内容，或者记录错误
+                // console.warn('MCP stream chunk parsing error or not OpenAI format, attempting passthrough for content:', line);
+                // Fallback: if it's not a parsable JSON, but contains content, wrap it.
+                // This part might need adjustment based on actual PROXY_URL2 stream format.
+                // For now, if it's not OpenAI like, we'll assume it's raw content for simplicity.
+                // A more robust solution would check the actual format of PROXY_URL2's stream.
+                if (!line.includes('[DONE]') && !line.includes('error')) {
+                   const fallbackChunk = {
+                    id: `chatcmpl-${Date.now()}`,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: HYBRID_MODEL_NAME,
+                    choices: [{ delta: { content: line.replace(/^data: /, '') }, index: 0, finish_reason: null }]
+                  };
+                  // res.write(`data: ${JSON.stringify(fallbackChunk)}\n\n`);
+                  // More safely, if we can't parse it as OpenAI, we should indicate an error or adapt.
+                  // For now, let's assume PROXY_URL2 sends OpenAI compatible chunks. If not, this needs rework.
+                  console.error('MCP stream chunk is not in expected OpenAI format and could not be parsed:', line);
+                  // To avoid breaking client, send an error chunk or handle gracefully
+                  // For now, we will assume valid OpenAI chunks from the upstream.
+                } else if (line.includes('[DONE]')) {
+                    res.write('data: [DONE]\n\n');
+                }
+              }
+            }
+          }
+        });
         outputResponse.data.on('end', () => {
           console.log('MCP 输出流结束');
+          if (!res.writableEnded) {
+             // Ensure [DONE] is sent if not already sent by a chunk
+            // res.write('data: [DONE]\n\n'); // This might be redundant if last chunk sends it
+            // res.end(); // End is handled by the main try/catch or if stream ends properly
+          }
           // 不重置 currentTask，等待新用户请求
         });
         outputResponse.data.on('error', (error) => {
           console.error('MCP 输出流错误:', error);
           if (!res.writableEnded) {
-            res.write(`data: {"error": "Stream error: ${error.message}"}\n\n`);
+            const errorPayload = {
+              id: `chatcmpl-err-${Date.now()}`,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: HYBRID_MODEL_NAME,
+              choices: [{ delta: { content: `\n\n[Stream Error: ${error.message}]` }, index: 0, finish_reason: 'error' }]
+            };
+            res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
             res.write('data: [DONE]\n\n');
             res.end();
           }
           currentTask = null;
         });
-      } else {
-        res.json(outputResponse.data);
+      } else { // Non-stream when Model_output_tool === 'true'
+        const rawResponseData = outputResponse.data;
+        const choice = rawResponseData.choices && rawResponseData.choices[0];
+        const message = choice && choice.message;
+        const content = message && message.content;
+        const finish_reason = choice && choice.finish_reason;
+
+        const formattedResponse = {
+          id: rawResponseData.id || `chatcmpl-${Date.now()}`,
+          object: 'chat.completion',
+          created: rawResponseData.created || Math.floor(Date.now() / 1000),
+          model: HYBRID_MODEL_NAME, // Use the hybrid model name
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: content || ''
+            },
+            index: 0,
+            finish_reason: finish_reason || 'stop' // Default to stop if not provided
+          }],
+          usage: rawResponseData.usage // Preserve usage statistics if available
+        };
+        res.json(formattedResponse);
         currentTask = null;
       }
     } else {
@@ -364,17 +455,36 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
                 continue;
               }
               const parsed = JSON.parse(data);
-              const content = parsed.choices[0]?.delta?.content || '';
-              if (content) {
-                process.stdout.write(content);
-                const outputContent = (Show_COT === 'true' && !currentTask.thinkingSent) ? `<think>${thinkingContent}</think>\n\n${content}` : content;
-                if (Show_COT === 'true' && !currentTask.thinkingSent) currentTask.thinkingSent = true;
+              const choice = parsed.choices && parsed.choices[0];
+              const delta = choice && choice.delta;
+              const content = delta && delta.content;
+              const finish_reason = choice && choice.finish_reason; // Extract finish_reason
+
+              // Send chunk if there's content OR if it's the final chunk with a finish_reason
+              if (content || finish_reason) {
+                if (content) { // Only write to stdout if there is actual content
+                    process.stdout.write(content);
+                }
+                
+                let outputContent = content || ''; // Ensure outputContent is at least an empty string if content is null/undefined but there's a finish_reason
+                if (Show_COT === 'true' && !currentTask.thinkingSent && thinkingContent) {
+                    // Prepend thinkingContent only if it exists and hasn't been sent
+                    if (content || finish_reason) { // Ensure we only send think content once, with the first actual data or finish signal
+                        outputContent = `<think>${thinkingContent}</think>\n\n${outputContent}`;
+                        currentTask.thinkingSent = true;
+                    }
+                }
+
                 const formattedChunk = {
-                  id: `chatcmpl-${Date.now()}`,
+                  id: parsed.id || `chatcmpl-${Date.now()}`, // Use id from original chunk if available
                   object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
+                  created: parsed.created || Math.floor(Date.now() / 1000), // Use created from original chunk
                   model: HYBRID_MODEL_NAME,
-                  choices: [{ delta: { content: outputContent }, index: 0, finish_reason: null }]
+                  choices: [{
+                    delta: content ? { content: outputContent } : {}, // Send delta only if content exists, otherwise empty delta for finish_reason
+                    index: 0,
+                    finish_reason: finish_reason || null
+                  }]
                 };
                 res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
               }
@@ -400,8 +510,8 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
           }
           currentTask = null;
         });
-      } else {
-        const outputResponse = await axios.post(
+      } else { // Non-stream when Model_output_tool === 'false'
+        const axiosResponse = await axios.post(
           `${PROXY_URL2}/v1/chat/completions`,
           outputConfig,
           {
@@ -410,18 +520,30 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
           }
         );
 
-        if (Show_COT === 'true') {
-          const modifiedResponse = {
-            ...outputResponse.data,
-            choices: outputResponse.data.choices.map(choice => ({
-              ...choice,
-              message: { ...choice.message, content: `<think>${thinkingContent}</think>\n\n${choice.message.content}` }
-            }))
-          };
-          res.json(modifiedResponse);
-        } else {
-          res.json(outputResponse.data);
+        const rawResponseData = axiosResponse.data;
+        const rawChoice = rawResponseData.choices && rawResponseData.choices[0];
+        let finalContent = rawChoice && rawChoice.message && rawChoice.message.content || '';
+
+        if (Show_COT === 'true' && thinkingContent) {
+          finalContent = `<think>${thinkingContent}</think>\n\n${finalContent}`;
         }
+
+        const formattedResponse = {
+          id: rawResponseData.id || `chatcmpl-${Date.now()}`,
+          object: 'chat.completion',
+          created: rawResponseData.created || Math.floor(Date.now() / 1000),
+          model: HYBRID_MODEL_NAME, // Ensure consistent model name
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: finalContent
+            },
+            index: 0,
+            finish_reason: rawChoice && rawChoice.finish_reason || 'stop'
+          }],
+          usage: rawResponseData.usage // Preserve usage statistics if available
+        };
+        res.json(formattedResponse);
         currentTask = null;
       }
     }
