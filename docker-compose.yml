@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    container_name: mixlite_app # 添加一个固定的容器名，方便引用
+    ports:
+      - "3032:4120"
+    volumes:
+      - .:/usr/src/app # 将当前目录挂载到容器的工作目录，方便开发时代码同步
+      - /usr/src/app/node_modules # 防止本地的 node_modules 覆盖容器中的
+    environment:
+      - NODE_ENV=development # 设置环境变量，可以根据需要修改
+
+    networks:
+      - shared_network
+
+networks:
+  shared_network:
+    name: my-docker-network # 与 newapi-service 使用的外部网络名称一致
+    external: true
