@@ -625,9 +625,49 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
       }
     }
   } catch (error) {
-    console.error('请求处理错误:', { message: error.message, status: error.response?.status, data: error.response?.data });
-    if (!res.headersSent && !res.writableEnded) {
-      res.status(500).json({ error: 'Internal server error', message: error.message });
+    console.error('请求处理错误:', {
+      message: error.message,
+      url: error.config?.url, // Log the URL that failed if available from axios error
+      method: error.config?.method, // Log the method
+      status: error.response?.status,
+      response_data: error.response?.data
+    });
+
+    // Ensure currentTask and its res object are valid before trying to use them
+    const clientRes = currentTask?.res;
+
+    if (clientRes && !clientRes.writableEnded) {
+      if (!clientRes.headersSent) {
+        // If headers not sent, we can send a clean JSON error
+        clientRes.status(error.response?.status || 500).json({
+          error: 'MixLite_Upstream_Error',
+          message: `Error during MixLite processing: ${error.message}`,
+          details: {
+            upstream_status: error.response?.status,
+            request_url: error.config?.url
+          }
+        });
+      } else {
+        // Headers were sent, so client expects a stream. Send an error chunk.
+        const errorPayload = {
+          id: `chatcmpl-err-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: originalRequest?.model || HYBRID_MODEL_NAME, // Use original model name if available
+          choices: [{
+            delta: { content: `\n\n[MixLite Service Error: Upstream request failed. Details: ${error.message} (Status: ${error.response?.status || 'N/A'})]` },
+            index: 0,
+            finish_reason: 'error'
+          }]
+        };
+        try {
+          clientRes.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
+          clientRes.write('data: [DONE]\n\n');
+          clientRes.end();
+        } catch (e) {
+          console.error("Error while trying to send error stream to client:", e.message);
+        }
+      }
     }
     currentTask = null;
   }
